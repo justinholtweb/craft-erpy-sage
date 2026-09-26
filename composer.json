@@ -1,6 +1,6 @@
 {
     "name": "justinholtweb/craft-erpy-sage",
-    "description": "Sage connectors for Erpy \u2014 Intacct, Sage 200, Sage X3 and Sage Business Cloud Accounting.",
+    "description": "Sage connectors for Erpy — Intacct, Sage 200, Sage X3 and Sage Business Cloud Accounting.",
     "version": "5.0.0",
     "type": "craft-plugin",
     "keywords": [
@@ -15,6 +15,7 @@
         "integration"
     ],
     "license": "proprietary",
+    "homepage": "https://justinholt.com/plugins/craft-erpy",
     "authors": [
         {
             "name": "Justin Holt",
@@ -22,7 +23,10 @@
         }
     ],
     "support": {
-        "email": "justin@justinholt.com"
+        "email": "justin@justinholt.com",
+        "docs": "https://justinholt.com/plugins/craft-erpy/docs/sage",
+        "source": "https://github.com/justinholtweb/craft-erpy-sage",
+        "issues": "https://github.com/justinholtweb/craft-erpy-sage/issues"
     },
     "minimum-stability": "stable",
     "prefer-stable": true,
@@ -47,7 +51,7 @@
         "handle": "erpy-sage",
         "developer": "Justin Holt",
         "developerUrl": "https://justinholt.com",
-        "documentationUrl": "https://github.com/justinholtweb/craft-erpy-sage/blob/main/README.md",
+        "documentationUrl": "https://justinholt.com/plugins/craft-erpy/docs/sage",
         "changelogUrl": "https://raw.githubusercontent.com/justinholtweb/craft-erpy-sage/main/CHANGELOG.md",
         "class": "justinholtweb\\erpysage\\Plugin"
     }

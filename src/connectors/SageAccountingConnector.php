@@ -93,7 +93,10 @@ class SageAccountingConnector extends Connector
                 'fr' => Craft::t('erpy', 'France'),
                 'es' => Craft::t('erpy', 'Spain'),
                 'de' => Craft::t('erpy', 'Germany'),
-            ], ['default' => 'gb']),
+            ], [
+                'default' => 'gb',
+                'instructions' => Craft::t('erpy', 'The country of the Sage business. It picks the Sage sign-in the Connect button opens.'),
+            ]),
 
             Field::heading(
                 Craft::t('erpy', 'Posting orders'),
@@ -116,7 +119,9 @@ class SageAccountingConnector extends Connector
             scope: 'full_access',
             extraAuthorizeParams: [
                 'filter' => 'apiv3.1',
-                'country' => 'gb',
+                // Which country's Sage sign-in the merchant lands on (gb, ie, us, ca, fr, es, de).
+                // Without it Sage shows a flag page and asks.
+                'country' => $this->country(),
             ],
         );
     }
@@ -148,8 +153,8 @@ class SageAccountingConnector extends Connector
 
         if (!$response->ok()) {
             return HealthResult::fail($response->errorMessage(), match ($response->status) {
-                401 => [Craft::t('erpy', 'The token has expired and could not be refreshed. Sage refresh tokens are valid for a limited period — connect again.')],
-                403 => [Craft::t('erpy', 'The app was approved for a different Sage business, or for a country other than the one selected above.')],
+                401 => [Craft::t('erpy', 'The token has expired and could not be refreshed. Sage refresh tokens are valid for a limited period, so use the Connect button to approve access in Sage again.')],
+                403 => [Craft::t('erpy', 'The Sage user who approved access cannot read this business, or its subscription does not include API access. Use the Connect button again, signing in as a user of the business you mean to connect.')],
                 default => [],
             });
         }
@@ -158,7 +163,7 @@ class SageAccountingConnector extends Connector
 
         return HealthResult::pass(Craft::t('erpy', 'Connected to Sage Accounting.'), [
             Craft::t('erpy', 'Business') => (string)($businesses[0]['name'] ?? '—'),
-            Craft::t('erpy', 'Country') => strtoupper((string)$this->setting('region', 'gb')),
+            Craft::t('erpy', 'Country') => strtoupper($this->country()),
         ]);
     }
 
@@ -192,12 +197,12 @@ class SageAccountingConnector extends Connector
             $address = (array)($row['main_address'] ?? []);
 
             return new ErpCustomer([
-                'code' => (string)($row['reference'] ?: $row['id'] ?? ''),
+                'code' => $this->customerCode($row['reference'] ?? null, $row['id'] ?? null),
                 'name' => (string)($row['name'] ?? ''),
-                'email' => $row['email'] ?: null,
-                'phone' => $row['telephone'] ?: null,
+                'email' => ($row['email'] ?? null) ?: null,
+                'phone' => ($row['telephone'] ?? null) ?: null,
                 'enabled' => !($row['deleted'] ?? false),
-                'taxId' => $row['tax_number'] ?: null,
+                'taxId' => ($row['tax_number'] ?? null) ?: null,
                 'creditLimit' => isset($row['credit_limit']) ? (float)$row['credit_limit'] : null,
                 'balance' => isset($row['balance']) ? (float)$row['balance'] : null,
                 'addresses' => $address !== [] ? [new ErpAddress([
@@ -227,8 +232,11 @@ class SageAccountingConnector extends Connector
 
             return new ErpInvoice([
                 'invoiceNumber' => (string)($row['invoice_number'] ?? $row['displayed_as'] ?? ''),
-                'orderNumber' => (string)($row['contact_reference'] ?? $row['reference'] ?? ''),
-                'customerCode' => (string)($row['contact']['id'] ?? ''),
+                // `reference` is the invoice's own reference, where pushOrder() writes the order
+                // number. `contact_reference` is the customer's reference, copied onto the
+                // invoice — the customer code, by the same rule the customer sync uses.
+                'orderNumber' => (string)($row['reference'] ?? ''),
+                'customerCode' => $this->customerCode($row['contact_reference'] ?? null, $row['contact']['id'] ?? null),
                 'issuedAt' => $this->date($row['date'] ?? null),
                 'dueAt' => $this->date($row['due_date'] ?? null),
                 'currency' => (string)($row['currency']['id'] ?? 'GBP'),
@@ -338,13 +346,44 @@ class SageAccountingConnector extends Connector
                     continue;
                 }
 
-                if ((string)($contact['reference'] ?? '') === $needle || (string)($contact['email'] ?? '') === $needle) {
+                if ($this->customerCode($contact['reference'] ?? null, $contact['id'] ?? null) === $needle
+                    || (string)($contact['email'] ?? '') === $needle) {
                     return (string)$contact['id'];
                 }
             }
         }
 
+        // A contact with no reference is known by its Sage id, which search does not look at.
+        if ($document->customerCode) {
+            $response = $this->transport()->get('contacts/' . rawurlencode($document->customerCode));
+
+            if ($response->ok() && (string)$response->at('id', '') === $document->customerCode
+                && (string)($response->at('reference') ?? '') === '') {
+                return $document->customerCode;
+            }
+        }
+
         return null;
+    }
+
+    /**
+     * A contact's customer code: its reference, or its Sage id when it has none. Customers,
+     * invoices and the order push all go through here, so an invoice lines up with the account
+     * it belongs to however the contact was set up.
+     */
+    private function customerCode(mixed $reference, mixed $id): string
+    {
+        $reference = is_scalar($reference) ? trim((string)$reference) : '';
+
+        return $reference !== '' ? $reference : (is_scalar($id) ? (string)$id : '');
+    }
+
+    /** The Sage country code, lower case, as the sign-in page takes it. */
+    private function country(): string
+    {
+        $country = strtolower((string)$this->setting('region', 'gb'));
+
+        return in_array($country, ['gb', 'ie', 'us', 'ca', 'fr', 'es', 'de'], true) ? $country : 'gb';
     }
 
     // ---------------------------------------------------------------------------------------

@@ -34,6 +34,11 @@ use justinholtweb\erpy\Plugin as Erpy;
  * any one is missing: an OAuth bearer token, an Azure subscription key identifying the
  * application, and an `X-Site` header naming which of the customer's Sage 200 sites to work in.
  * A missing X-Site is the usual reason a correctly-authenticated request returns nothing at all.
+ *
+ * Region is not a setting, because it changes nothing: Sage issues one OAuth audience
+ * (`s200ukipd/sage200`) for the UK and Ireland, and serves both from the `/uk/` API path — Sage's
+ * own Irish knowledge base uses it. What does change the path is the edition: Standard is
+ * `sage200`, Professional is `sage200extra`.
  */
 class Sage200Connector extends Connector
 {
@@ -78,10 +83,13 @@ class Sage200Connector extends Connector
     public static function settingsFields(): array
     {
         return [
-            Field::select('region', Craft::t('erpy', 'Region'), [
-                'uk' => Craft::t('erpy', 'United Kingdom'),
-                'ie' => Craft::t('erpy', 'Ireland'),
-            ], ['default' => 'uk']),
+            Field::select('edition', Craft::t('erpy', 'Edition'), [
+                'professional' => Craft::t('erpy', 'Sage 200 Professional'),
+                'standard' => Craft::t('erpy', 'Sage 200 Standard'),
+            ], [
+                'default' => 'professional',
+                'instructions' => Craft::t('erpy', 'The two editions answer on different API paths. UK and Irish companies use the same ones.'),
+            ]),
 
             Field::heading(
                 Craft::t('erpy', 'Sage application'),
@@ -110,7 +118,8 @@ class Sage200Connector extends Connector
             authorizeUrl: 'https://id.sage.com/authorize',
             tokenUrl: 'https://id.sage.com/oauth/token',
             scope: 'openid profile email offline_access',
-            extraAuthorizeParams: ['audience' => 'https://api.columbus.sage.com/uk/sage200extra'],
+            // One audience for both editions and both countries, as Sage documents it.
+            extraAuthorizeParams: ['audience' => 's200ukipd/sage200'],
         );
     }
 
@@ -118,8 +127,9 @@ class Sage200Connector extends Connector
     {
         return (new Transport())
             ->setBaseUri(sprintf(
-                'https://api.columbus.sage.com/%s/sage200extra/accounts/v1',
-                (string)$this->setting('region', 'uk'),
+                // `uk` is not a country switch: Sage serves Irish companies from the same path.
+                'https://api.columbus.sage.com/uk/%s/accounts/v1',
+                $this->edition() === 'standard' ? 'sage200' : 'sage200extra',
             ))
             ->setDefaultHeaders([
                 'Accept' => 'application/json',
@@ -138,7 +148,7 @@ class Sage200Connector extends Connector
         if ($auth instanceof OAuth2AuthorizationCode && !$auth->isAuthorized()) {
             return HealthResult::fail(
                 Craft::t('erpy', 'Not connected yet.'),
-                [Craft::t('erpy', 'Save the credentials, then use the Connect button to approve access in Sage once.')],
+                [Craft::t('erpy', 'Save the client id, secret and subscription key, then use the Connect button to approve access in Sage once.')],
             );
         }
 
@@ -146,15 +156,16 @@ class Sage200Connector extends Connector
 
         if (!$response->ok()) {
             return HealthResult::fail($response->errorMessage(), match ($response->status) {
-                401 => [Craft::t('erpy', 'The token has expired or the subscription key is wrong. They fail identically here, so check both.')],
+                401 => [Craft::t('erpy', 'The token has expired or the subscription key is wrong. They fail identically here, so check the key, then use the Connect button to approve access in Sage again.')],
                 403 => [Craft::t('erpy', 'Check the site id — a wrong X-Site is refused rather than ignored on some Sage 200 releases.')],
+                404 => [Craft::t('erpy', 'Check the edition: Standard and Professional answer on different API paths.')],
                 default => [],
             });
         }
 
         return HealthResult::pass(Craft::t('erpy', 'Connected to Sage 200.'), [
             Craft::t('erpy', 'Site') => (string)$this->setting('siteId'),
-            Craft::t('erpy', 'Region') => strtoupper((string)$this->setting('region', 'uk')),
+            Craft::t('erpy', 'Edition') => $this->edition() === 'standard' ? 'Sage 200 Standard' : 'Sage 200 Professional',
         ]);
     }
 
@@ -315,16 +326,25 @@ class Sage200Connector extends Connector
             return PushResult::rejected(Craft::t('erpy', 'Sage 200 needs a customer reference. Set a guest customer code on the order mapping, or link this customer to a Sage account.'));
         }
 
-        $existing = $this->transport()->get('sales_orders', [
-            '$filter' => "customer_document_no eq '" . $this->escape($document->orderNumber) . "'",
-            '$top' => 1,
-        ]);
+        $documentNo = mb_substr($document->orderNumber, 0, 60);
 
-        if ($existing->ok() && $remoteId === null) {
-            $rows = (array)$existing->at('$items', []);
+        if ($remoteId === null) {
+            $existing = $this->transport()->get('sales_orders', [
+                '$filter' => "customer_document_no eq '" . $this->escape($documentNo) . "'",
+                '$top' => 10,
+            ]);
 
-            if (is_array($rows[0] ?? null)) {
-                return PushResult::alreadyExists((string)$rows[0]['id'], (string)($rows[0]['document_no'] ?? ''));
+            if ($existing->ok()) {
+                $body = $existing->json_();
+                $rows = is_array($body['$items'] ?? null) ? $body['$items'] : (array_is_list($body) ? $body : []);
+
+                // Compared here as well as filtered there: a filter the API ignored must not
+                // turn every order into a duplicate of the first one it returns.
+                foreach ($rows as $row) {
+                    if (is_array($row) && (string)($row['customer_document_no'] ?? '') === $documentNo) {
+                        return PushResult::alreadyExists((string)($row['id'] ?? ''), (string)($row['document_no'] ?? ''));
+                    }
+                }
             }
         }
 
@@ -343,7 +363,7 @@ class Sage200Connector extends Connector
 
         $payload = array_filter([
             'customer_reference' => $document->customerCode,
-            'customer_document_no' => mb_substr($document->orderNumber, 0, 60),
+            'customer_document_no' => $documentNo,
             'document_date' => ($document->orderedAt ?? new DateTime())->format('Y-m-d'),
             'analysis_code_1' => null,
             'lines' => $lines,
@@ -382,6 +402,11 @@ class Sage200Connector extends Connector
     // ---------------------------------------------------------------------------------------
     // Plumbing
     // ---------------------------------------------------------------------------------------
+
+    private function edition(): string
+    {
+        return (string)$this->setting('edition', 'professional');
+    }
 
     private function page(string $resource, FetchCriteria $criteria, string $entity, callable $make, bool $delta = true): Page
     {

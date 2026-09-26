@@ -342,16 +342,23 @@ class SageIntacctConnector extends Connector
         }
 
         $type = $this->escape((string)$this->setting('orderDocumentType', 'Sales Order'));
-        $orderNumber = $this->escape($document->orderNumber);
+        $customerDocNo = mb_substr($document->orderNumber, 0, 60);
 
         // CUSTOMERDOCNO carries the Commerce order number, so a retry can ask before it creates.
-        $existing = $this->call($this->readByQuery('SODOCUMENT', 'RECORDNO,DOCNO', "CUSTOMERDOCNO = '$orderNumber' AND DOCPARID = '$type'", 1));
+        // The number is compared on the way back as well: a query Intacct did not apply must not
+        // turn every order into a duplicate of the first one it returns.
+        if ($remoteId === null) {
+            $existing = $this->call($this->readByQuery(
+                'SODOCUMENT',
+                'RECORDNO,DOCNO,CUSTOMERDOCNO',
+                "CUSTOMERDOCNO = '" . $this->escape($customerDocNo) . "' AND DOCPARID = '$type'",
+                10,
+            ));
 
-        if ($existing !== null && $remoteId === null) {
-            $rows = $this->rowsFrom($existing);
-
-            if ($rows !== []) {
-                return PushResult::alreadyExists((string)($rows[0]['RECORDNO'] ?? ''), (string)($rows[0]['DOCNO'] ?? ''));
+            foreach ($existing !== null ? $this->rowsFrom($existing) : [] as $row) {
+                if ((string)($row['CUSTOMERDOCNO'] ?? '') === $customerDocNo) {
+                    return PushResult::alreadyExists((string)($row['RECORDNO'] ?? ''), (string)($row['DOCNO'] ?? ''));
+                }
             }
         }
 
@@ -373,8 +380,8 @@ class SageIntacctConnector extends Connector
             . $this->tag('datecreated', $this->intacctDate($document->orderedAt ?? new DateTime()))
             . $this->tag('customerid', $document->customerCode)
             . $this->tag('documentno', '')
-            . $this->tag('referenceno', mb_substr($document->orderNumber, 0, 60))
-            . $this->tag('customerdocno', mb_substr($document->orderNumber, 0, 60))
+            . $this->tag('referenceno', $customerDocNo)
+            . $this->tag('customerdocno', $customerDocNo)
             . ($document->currency ? $this->tag('currency', $document->currency) : '')
             . ($document->customerNote ? $this->tag('message', $document->customerNote) : '')
             . '<sotransitems>' . $lines . '</sotransitems>'

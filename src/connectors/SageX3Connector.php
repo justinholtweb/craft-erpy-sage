@@ -23,6 +23,7 @@ use justinholtweb\erpy\models\canonical\ErpOrder;
 use justinholtweb\erpy\models\canonical\ErpOrderStatus;
 use justinholtweb\erpy\models\canonical\ErpProduct;
 use justinholtweb\erpy\models\canonical\ErpStock;
+use justinholtweb\erpy\Plugin as Erpy;
 
 /**
  * Sage X3, through the X3 REST web services.
@@ -34,9 +35,22 @@ use justinholtweb\erpy\models\canonical\ErpStock;
  *
  * X3 is also strongly folder-scoped: the folder is in the URL, and the same credentials against
  * two folders are two entirely separate datasets.
+ *
+ * The Commerce order number travels in SORDER's `CUSORDREF`, which the X3 dictionary declares as
+ * type A, length 20 — and Commerce's order numbers are 32 characters. SORDER has no longer
+ * reference field, so the number is cut to its first 20 characters by cusOrdRef(), and that one
+ * function produces the value written, the value a retry looks for, and the value order status
+ * is matched on. Commerce numbers are random hex, so 20 of them are as unique as 32 for any
+ * store's lifetime. Commerce's own short `reference` would read better but is 7 characters by
+ * default, which collides within a few tens of thousands of orders; an idempotency key cannot.
+ * On the way back, a 20-character `CUSORDREF` is turned into the full Commerce number through
+ * the identity map, which knows it by the X3 order number `SOHNUM`.
  */
 class SageX3Connector extends Connector
 {
+    /** SORDER.CUSORDREF: type A, length 20, in the X3 data dictionary. */
+    private const CUSORDREF_LENGTH = 20;
+
     public static function handle(): string
     {
         return 'sage-x3';
@@ -239,7 +253,7 @@ class SageX3Connector extends Connector
 
     protected function fetchOrderStatuses(FetchCriteria $criteria): Page
     {
-        return $this->page((string)$this->setting('orderRepresentation', 'SORDER'), $criteria, Entity::ORDER_STATUS, function(array $row): ErpOrderStatus {
+        $page = $this->page((string)$this->setting('orderRepresentation', 'SORDER'), $criteria, Entity::ORDER_STATUS, function(array $row): ErpOrderStatus {
             // X3 tracks delivery and invoicing separately: 1 not delivered, 2 partly, 3 fully.
             $delivery = (int)($row['DLVSTA'] ?? 1);
             $invoicing = (int)($row['INVSTA'] ?? 1);
@@ -260,6 +274,12 @@ class SageX3Connector extends Connector
                 'raw' => $row,
             ]);
         }, deltaField: 'UPDDAT');
+
+        foreach ($page->items as $status) {
+            $status->orderNumber = $this->commerceOrderNumber($status->orderNumber, (string)$status->remoteId);
+        }
+
+        return $page;
     }
 
     // ---------------------------------------------------------------------------------------
@@ -275,17 +295,23 @@ class SageX3Connector extends Connector
         $representation = (string)$this->setting('orderRepresentation', 'SORDER');
         $site = (string)$this->setting('salesSite', '');
 
-        $existing = $this->transport()->get($representation, [
-            'representation' => $representation . '.$query',
-            'where' => "CUSORDREF eq '" . $this->escape($document->orderNumber) . "'",
-            'count' => 1,
-        ]);
+        $cusOrdRef = $this->cusOrdRef($document->orderNumber);
 
-        if ($existing->ok() && $remoteId === null) {
-            $rows = (array)$existing->at('$resources', []);
+        if ($remoteId === null) {
+            $existing = $this->transport()->get($representation, [
+                'representation' => $representation . '.$query',
+                'where' => "CUSORDREF eq '" . $this->escape($cusOrdRef) . "'",
+                'count' => 20,
+            ]);
 
-            if (is_array($rows[0] ?? null)) {
-                return PushResult::alreadyExists((string)($rows[0]['SOHNUM'] ?? ''), (string)($rows[0]['SOHNUM'] ?? ''));
+            if ($existing->ok()) {
+                // Compared here as well as filtered there: a representation that ignores the
+                // where clause must not turn every order into a duplicate of the first one.
+                foreach ((array)$existing->at('$resources', []) as $row) {
+                    if (is_array($row) && (string)($row['CUSORDREF'] ?? '') === $cusOrdRef) {
+                        return PushResult::alreadyExists((string)($row['SOHNUM'] ?? ''), (string)($row['SOHNUM'] ?? ''));
+                    }
+                }
             }
         }
 
@@ -304,7 +330,7 @@ class SageX3Connector extends Connector
         $payload = array_filter([
             'SALFCY' => $site ?: null,
             'BPCORD' => $document->customerCode,
-            'CUSORDREF' => mb_substr($document->orderNumber, 0, 30),
+            'CUSORDREF' => $cusOrdRef,
             'ORDDAT' => ($document->orderedAt ?? new DateTime())->format('Y-m-d'),
             'CUR' => $document->currency,
             'LIN' => $lines,
@@ -388,6 +414,42 @@ class SageX3Connector extends Connector
         }
 
         return new Page($items, count($rows) >= $count ? (string)($startIndex + $count) : null);
+    }
+
+    /**
+     * The Commerce order number as it fits in CUSORDREF. Written, looked up and matched on by
+     * this one function, so the three cannot drift apart.
+     */
+    private function cusOrdRef(string $orderNumber): string
+    {
+        return mb_substr($orderNumber, 0, self::CUSORDREF_LENGTH);
+    }
+
+    /**
+     * The full Commerce order number behind a CUSORDREF.
+     *
+     * A reference shorter than the column was never cut, so it already is the number. One that
+     * fills the column may have been, and the identity map knows the order Erpy pushed as this
+     * SOHNUM. An order Erpy did not push keeps its CUSORDREF, and the engine reports it as not
+     * found rather than guessing.
+     */
+    private function commerceOrderNumber(string $cusOrdRef, string $sohNum): string
+    {
+        if ($sohNum === '' || mb_strlen($cusOrdRef) < self::CUSORDREF_LENGTH) {
+            return $cusOrdRef;
+        }
+
+        try {
+            $link = Erpy::getInstance()->getLinks()->findByRemoteId($this->connection, Entity::ORDER, $sohNum);
+        } catch (\Throwable) {
+            return $cusOrdRef;
+        }
+
+        // Only trust the link if it is the same order: after a folder is restored or renumbered
+        // a SOHNUM can come back belonging to somebody else's order.
+        return $link !== null && $this->cusOrdRef((string)$link->naturalKey) === $cusOrdRef
+            ? (string)$link->naturalKey
+            : $cusOrdRef;
     }
 
     private function escape(string $value): string
